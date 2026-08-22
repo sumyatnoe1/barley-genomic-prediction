@@ -1,105 +1,164 @@
-# Between-population cross-validation (rrBLUP) ####
+# BETWEEN-POPULATION CROSS-VALIDATION
 
 library(rrBLUP)
 library(writexl)
 
-set.seed(123)
+# 1. LOAD DATA
 
+geno_2R <- read.delim("2row_geno.txt", header = TRUE)
+geno_6R <- read.delim("6row_geno.txt", header = TRUE)
 
-format_geno <- function(file) {
-  geno <- read.delim(file, header = TRUE)
+pheno_2R <- read.delim("2row_pheno.txt",header = TRUE,sep = "\t",na.strings = "NA")
+pheno_6R <- read.delim("6row_pheno.txt",header = TRUE,sep = "\t",na.strings = "NA")
+
+# 2. FORMAT GENOTYPE DATA
+
+format_geno <- function(geno) {
   geno[geno == "0"] <- -1
   geno[geno == "1"] <- 0
   geno[geno == "2"] <- 1
+  
   rownames(geno) <- geno$taxa
   geno <- geno[, -1, drop = FALSE]
+  
+  # Ensure marker data are numeric
   geno[] <- lapply(geno, function(x) as.numeric(as.character(x)))
+  
   return(geno)
 }
 
-format_pheno <- function(file) {
-  pheno <- read.delim(file, header = TRUE)
+geno_2R <- format_geno(geno_2R)
+geno_6R <- format_geno(geno_6R)
+
+# 3. FORMAT PHENOTYPE DATA
+
+format_pheno <- function(pheno) {
   rownames(pheno) <- pheno$Genotype
   pheno <- pheno[, "BLUP", drop = FALSE]
   return(pheno)
 }
 
-impute_mean <- function(df) {
-  df[] <- lapply(df, function(x) {
-    x[is.na(x)] <- mean(x, na.rm = TRUE)
-    x
-  })
-  return(df)
+pheno_2R <- format_pheno(pheno_2R)
+pheno_6R <- format_pheno(pheno_6R)
+
+# 4. KEEP COMMON MARKERS
+
+common_markers <- Reduce(
+  intersect,
+  list(
+    colnames(geno_2R),
+    colnames(geno_6R)
+  ))
+
+geno_2R <- geno_2R[, common_markers, drop = FALSE]
+geno_6R <- geno_6R[, common_markers, drop = FALSE]
+
+cat("Starting common markers:", length(common_markers), "\n")
+
+# 5. CHOOSE TRAINING AND VALIDATION POPULATIONS
+
+geno_train <- geno_6R
+pheno_train <- pheno_6R
+
+geno_valid <- geno_2R
+pheno_valid <- pheno_2R
+
+scenario_name <- "6R_to_2R"
+
+# 6. MATCH GENOTYPE AND PHENOTYPE IDs
+                   
+train_ids <- intersect(
+  rownames(geno_train),
+  rownames(pheno_train))
+
+valid_ids <- intersect(
+  rownames(geno_valid),
+  rownames(pheno_valid))
+
+geno_train <- geno_train[
+  train_ids,
+  ,drop = FALSE]
+
+pheno_train <- pheno_train[
+  train_ids,
+  ,drop = FALSE]
+
+geno_valid <- geno_valid[
+  valid_ids,
+  ,drop = FALSE]
+
+pheno_valid <- pheno_valid[
+  valid_ids,
+  , drop = FALSE]
+
+# 7. CHECK DATA
+
+cat("\nScenario:", scenario_name, "\n")
+cat("Training genotypes:", nrow(geno_train), "\n")
+cat("Validation genotypes:", nrow(geno_valid), "\n")
+cat("Starting markers:", ncol(geno_train), "\n")
+
+if (
+  anyNA(geno_train) ||
+  anyNA(geno_valid)
+) {
+  stop("Missing values")
 }
 
-# Data files ####
+# 8. REMOVE ZERO-VARIANCE MARKERS
+#    BASED ON TRAINING POPULATION ONLY
 
-geno_TS <- format_geno("2row_geno")
-pheno_TS <- format_pheno("2row_pheno")
+marker_sd <- apply(geno_train,2, sd,na.rm = TRUE)
+keep_markers <- is.finite(marker_sd) & marker_sd > 0
 
-geno_BS <- format_geno("6row_geno")
-pheno_BS <- format_pheno("6row_pheno")
+cat(
+  "Zero-variance markers removed:",
+  sum(!keep_markers),
+  "\n")
 
-# Other options:
-# "genebank_geno" / "genebank_pheno"
-# "2row_6row_geno" / "2row_6row_pheno"
-# "all_geno" / "all_pheno"
-# "2row_genebank_geno" / "2row_genebank_pheno"
-# "6row_genebank_geno" / "6row_genebank_pheno"
+cat(
+  "Markers retained:",
+  sum(keep_markers),
+  "\n")
 
-# Match genotype and phenotype ####
+# Use exactly the same retained markers in TS and VS
 
-common_TS_ids <- intersect(rownames(geno_TS), rownames(pheno_TS))
-geno_TS <- geno_TS[common_TS_ids, ]
-pheno_TS <- pheno_TS[common_TS_ids, , drop = FALSE]
+geno_train <- geno_train[,keep_markers,drop = FALSE]
+geno_valid <- geno_valid[, keep_markers,drop = FALSE]
 
-common_BS_ids <- intersect(rownames(geno_BS), rownames(pheno_BS))
-geno_BS <- geno_BS[common_BS_ids, ]
-pheno_BS <- pheno_BS[common_BS_ids, , drop = FALSE]
+# 9. FIT RR-BLUP MODEL
 
-# Find common makrers####
+pmodel <- mixed.solve(
+  y = pheno_train$BLUP,
+  Z = as.matrix(geno_train))
 
-common_markers <- intersect(colnames(geno_TS), colnames(geno_BS))
-geno_TS <- geno_TS[, common_markers]
-geno_BS <- geno_BS[, common_markers]
+# 10. PREDICT VALIDATION POPULATION
 
+X_valid <- cbind(1,as.matrix(geno_valid))
+u_effects <- c(pmodel$beta,pmodel$u)
+y_pred <- X_valid %*% u_effects
 
-geno_TS <- impute_mean(geno_TS)
-geno_BS <- impute_mean(geno_BS)
+# 11. PREDICTIVE ABILITY
 
+PA <- cor(pheno_valid$BLUP,y_pred,use = "pairwise.complete.obs")
 
-geno_combined <- rbind(geno_TS, geno_BS)
-geno_mat <- as.matrix(geno_combined)
+cat("\nPredictive Ability:", round(PA, 3), "\n")
 
-maf <- apply(geno_mat, 2, function(x) {
-  x <- x[!is.na(x)]
-  p <- (mean(x) + 1) / 2
-  min(p, 1 - p)
-})
-
-maf_threshold <- 0.05
-valid_markers <- names(maf[maf > 0 & maf >= maf_threshold])
-
-geno_TS <- geno_TS[, valid_markers]
-geno_BS <- geno_BS[, valid_markers]
-
-cat("Markers retained:", length(valid_markers), "\n")
-
-# Run CV ####
-
-model <- mixed.solve(y = pheno_TS$BLUP, Z = as.matrix(geno_TS))
-
-
-X <- cbind(1, as.matrix(geno_BS))
-u <- c(model$beta, model$u)
-pred <- as.vector(X %*% u)
-
-# Save results ####
-
+# 12. SAVE RESULTS
+                   
 results <- data.frame(
-  Genotype = rownames(geno_BS),
-  Observed = pheno_BS$BLUP,
-  Predicted = pred
-)
+  Genotype = rownames(geno_valid),
+  Observed = pheno_valid$BLUP,
+  Predicted = as.vector(y_pred))
 
-write_xlsx(results, "between_CV_results.xlsx")
+summary_results <- data.frame(
+  Scenario = scenario_name,
+  Training_N = nrow(geno_train),
+  Validation_N = nrow(geno_valid),
+  Starting_Markers = length(common_markers),
+  Zero_Variance_Removed = sum(!keep_markers),
+  Markers_Used = ncol(geno_train),
+  Predictive_Ability = PA)
+
+output_name <- paste0(scenario_name,"_between_population_CV.xlsx")
+write_xlsx(list(Summary = summary_results,Predictions = results),output_name)
