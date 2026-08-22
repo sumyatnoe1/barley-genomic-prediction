@@ -1,130 +1,140 @@
 
-# Within-population cross-validation (rrBLUP) ####
+# WITHIN-POPULATION CROSS-VALIDATION USING RR-BLUP #
+# Random 80% training / 20% validation, repeated 500 times #
 
-library(openxlsx)
 library(rrBLUP)
+library(openxlsx)
 
 set.seed(123)
 
-# Data files ####
+# 1. LOAD DATA #
 
-genotype_file <- "2row_geno"
-phenotype_file <- "2row_pheno"
+genotype_data <- read.delim("genotypic_data.txt", header = TRUE, check.names = FALSE)
+phenotype_data <- read.delim("whole_phenotype.txt", header = TRUE, sep = "\t", na.strings = "NA")
 
-# Other options:
-# "6row_geno" / "6row_pheno"
-# "genebank_geno" / "genebank_pheno"
-# "2row_6row_geno" / "2row_6row_pheno"
-# "all_geno" / "all_pheno"
-
-# Data files_1 ####
-
-genotype_data <- read.table(genotype_file, header = TRUE, check.names = FALSE)
-phenotype_data <- read.table(phenotype_file, header = TRUE, check.names = FALSE)
-
-# Genotypic data ####
+# 2. FORMAT GENOTYPE DATA #
 
 genotype_data[genotype_data == "0"] <- -1
 genotype_data[genotype_data == "1"] <- 0
 genotype_data[genotype_data == "2"] <- 1
 
 rownames(genotype_data) <- genotype_data$taxa
-genotype_data <- genotype_data[, setdiff(names(genotype_data), "taxa"), drop = FALSE]
+genotype_data <- genotype_data[, -1, drop = FALSE]
 
-genotype_data[] <- lapply(genotype_data, function(x) as.numeric(as.character(x)))
+genotype_data[] <- lapply(
+  genotype_data,
+  function(x) as.numeric(as.character(x)))
 
-# Match genotype and phenotype ####
+# 3. FORMAT PHENOTYPE DATA #
 
 rownames(phenotype_data) <- phenotype_data$Genotype
+phenotype_data <- phenotype_data[, "BLUP", drop = FALSE]
 
-common_ids <- intersect(rownames(phenotype_data), rownames(genotype_data))
-phenotype_data <- phenotype_data[common_ids, , drop = FALSE]
-genotype_data  <- genotype_data [common_ids, , drop = FALSE]
+# Match genotype and phenotype IDs
 
-if (!"BLUP" %in% names(phenotype_data)) stop("Missing BLUP column")
-if (any(!is.finite(phenotype_data$BLUP))) stop("Non-finite BLUP values")
+common_ids <- intersect(rownames(genotype_data), rownames(phenotype_data))
+genotype_data <- genotype_data[common_ids,,drop = FALSE]
+phenotype_data <- phenotype_data[common_ids,,drop = FALSE]
 
-
-impute_col_mean <- function(v) {
-  mu <- mean(v, na.rm = TRUE)
-  if (!is.finite(mu)) mu <- 0
-  v[!is.finite(v)] <- mu
-  v
+if (any(!is.finite(phenotype_data$BLUP))) {
+  stop("Non-finite BLUP values detected.")
 }
 
-genotype_data[] <- lapply(genotype_data, impute_col_mean)
+if (anyNA(genotype_data)) {
+  stop("Missing values detected in genotype matrix.")
+}
 
-
-# Remove zero-varianec markers ####
-
-marker_sd <- vapply(genotype_data, sd, numeric(1))
-genotype_data <- genotype_data[, marker_sd > 0, drop = FALSE]
-
-
-pheno_geno <- cbind(phenotype_data, genotype_data)
-pheno_geno$Genotype <- factor(pheno_geno$Genotype)
-
-markernames <- colnames(genotype_data)
-
-# Run CV ####
-
+# 4. CROSS-VALIDATION SETTINGS #
+  
 runs <- 500
-train_prop <- 0.8
+train_prop <- 0.80
 
-res <- NULL
-validation_results <- vector("list", runs)
-
-
-all_ids <- unique(as.character(pheno_geno$Genotype))
+all_ids <- rownames(genotype_data)
 train_size <- round(length(all_ids) * train_prop)
 
+res <- data.frame()
+marker_results <- data.frame()
+validation_results <- vector("list", runs)
+
+# 5. RUN CROSS-VALIDATION #
+
 for (r in seq_len(runs)) {
-  
-  cat("Run:", r, "\n")
-  
+
+  # Random 80% training / 20% validation split
+
   train_ids <- sample(all_ids, train_size)
-  test_ids  <- setdiff(all_ids, train_ids)
-  
-  train_data <- pheno_geno[pheno_geno$Genotype %in% train_ids, ]
-  test_data  <- pheno_geno[pheno_geno$Genotype %in% test_ids, ]
-  
-  y_train <- as.numeric(train_data$BLUP)
-  
-  Z_train <- as.matrix(train_data[, markernames])
-  Z_test  <- as.matrix(test_data[, markernames])
-  
-  model <- mixed.solve(y = y_train, Z = Z_train)
-  
-  X <- cbind(1, Z_test)
-  u <- c(model$beta, model$u)
-  pred <- as.vector(X %*% u)
-  
-  obs <- as.numeric(test_data$BLUP)
-  
-  pa <- if (sd(obs) > 0 && sd(pred) > 0) cor(obs, pred) else NA
-  
+  test_ids <- setdiff(all_ids, train_ids)
+
+  geno_train <- genotype_data[rain_ids, ,drop = FALSE]
+  geno_test <- genotype_data[test_ids,,drop = FALSE]
+
+  pheno_train <- phenotype_data[train_ids,,drop = FALSE]
+  pheno_test <- phenotype_data[test_ids, ,drop = FALSE]
+
+  # Remove zero-variance markers based on training set
+
+  marker_sd <- apply(geno_train,2,sd,na.rm = TRUE)
+  keep_markers <- is.finite(marker_sd) & marker_sd > 0
+
+  geno_train <- geno_train[, keep_markers,drop = FALSE]
+  geno_test <- geno_test[,keep_markers,drop = FALSE]
+
+  # Fit RR-BLUP model
+
+  model <- mixed.solve(y = pheno_train$BLUP,Z = as.matrix(geno_train))
+
+  # Predict validation set
+
+  X_test <- cbind(1,as.matrix(geno_test))
+  u_effects <- c(model$beta,model$u)
+  pred <- as.vector(X_test %*% u_effects)
+  obs <- pheno_test$BLUP
+
+  # Calculate predictive ability
+
+  pa <- if (sd(obs) > 0 && sd(pred) > 0) {cor(obs, pred) } else {NA}
+
+  # Save results
+
   res <- rbind(res, data.frame(Run = r, Predictive_Ability = pa))
-  
+
+  marker_results <- rbind(marker_results, data.frame(Run = r,Starting_Markers = ncol(genotype_data), 
+                  Zero_Variance_Removed = sum(!keep_markers), Markers_Used = sum(keep_markers)))
+
   validation_results[[r]] <- data.frame(
-    Run = r,
-    Genotype = test_data$Genotype,
-    Observed = obs,
-    Predicted = pred
-  )
-}
+    Run = r,Genotype = rownames(geno_test),
+    Observed = obs, Predicted = pred)}
 
+# 6. SUMMARIZE RESULTS #
 
-# Save results ####
+all_validation_results <- do.call(
+  rbind, validation_results)
 
-all_validation_results <- do.call(rbind, validation_results)
+overall_summary <- data.frame(
+  Total_Genotypes = nrow(genotype_data),
+  Starting_Markers = ncol(genotype_data),
+  Repetitions = runs,
+  Training_Proportion = train_prop,
+  Mean_Markers_Used = mean(marker_results$Markers_Used),
+  Minimum_Markers_Used = min(marker_results$Markers_Used),
+  Maximum_Markers_Used = max(marker_results$Markers_Used),
+  Mean_PA = mean(res$Predictive_Ability, na.rm = TRUE),
+  SD_PA = sd(res$Predictive_Ability, na.rm = TRUE)
+)
+
+# 7. SAVE RESULTS #
 
 wb <- createWorkbook()
+
+addWorksheet(wb, "Overall_Summary")
 addWorksheet(wb, "Predictive_Abilities")
+addWorksheet(wb, "Marker_Counts")
 addWorksheet(wb, "Validation_GEBVs")
 
+writeData(wb, "Overall_Summary", overall_summary)
 writeData(wb, "Predictive_Abilities", res)
+writeData(wb, "Marker_Counts", marker_results)
 writeData(wb, "Validation_GEBVs", all_validation_results)
 
-saveWorkbook(wb, "within_CV_results.xlsx", overwrite = TRUE)
-
-cat("Mean PA:", mean(res$Predictive_Ability, na.rm = TRUE), "\n")
+saveWorkbook( wb, "whole_population_within_CV_500runs.xlsx",
+  overwrite = TRUE)
